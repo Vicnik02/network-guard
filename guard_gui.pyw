@@ -4,12 +4,14 @@ Network Guard - 可视化界面版
 ============================
 功能：
   - 实时显示当前 Wi-Fi / 是否处于受控网络 / 守护状态
-  - 图形化编辑配置（受控网络、受控应用、检测间隔、测试 SSID），保存即生效
-  - 受控网络命中时弹窗警告：确定=放行本次运行，取消=强制结束进程
+  - 图形化编辑配置（受控网络、受控应用/应用组、检测间隔、测试 SSID），保存即生效
+  - 受控网络命中时：立即冻结受控应用并弹出带倒计时的警告框
+    - 允许 -> 恢复运行；关闭 -> 优雅退出优先，超时才强制结束
+    - 超时未确认默认放行（可配置 timeout_action）
   - 查看当前受管控进程，可手动强制结束
   - 实时日志窗口
   - 开机自启动开关（注册表 HKCU Run）
-  - 关闭窗口可隐藏到后台继续守护；再次双击本程序可唤回窗口
+  - 系统托盘图标；关闭窗口缩到托盘后台继续守护
 
 依赖：同目录下的 guard.pyw（核心检测逻辑）与 config.json
 """
@@ -65,16 +67,16 @@ def read_config():
 
 
 def write_config(cfg):
-    data = {
+    """更新 GUI 管理的键，保留 config.json 中的其他自定义键。"""
+    updates = {
         "watch_ssids": cfg.get("watch_ssids", []),
         "watch_apps": cfg.get("watch_apps", []),
         "poll_interval": cfg.get("poll_interval", 2),
         "idle_interval": cfg.get("idle_interval", 5),
         "test_ssid": cfg.get("test_ssid", ""),
     }
-    with io.open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    log("配置已保存: {}".format(data))
+    guard.write_config_partial(updates)
+    log("配置已保存: {}".format(updates))
 
 
 def make_tray_image(color):
@@ -146,14 +148,29 @@ class Monitor(threading.Thread):
         self.ui_queue = ui_queue
         self.stop_evt = threading.Event()
         self.ask_lock = threading.Event()   # 等待用户回答
-        self.ask_answer = False             # True=放行 / False=结束
+        self.ask_answer = False             # True=放行 / False=关闭
+        self.ask_timed_out = False          # 本次是否为超时触发
         self.ask_open = False               # 是否有待确认弹窗
-        self.ask_payload = None             # 待确认的 [(进程名, PID), ...]
+        self.ask_payload = None             # 待确认数据（含 pids）
+        self.ask_pids = set()               # 待确认的 PID 集合（供状态表标色）
         self.suspended_pids = set()         # 已被冻结等待确认的 PID
 
     def run(self):
-        allowed = set()
+        allowed = set()  # {(pid, 创建时间)}
+        guard.resume_leaked_suspensions()  # P1-4：恢复上次泄漏的冻结进程
         log("GUI 监控线程启动")
+        try:
+            self._loop(allowed)
+        finally:
+            # P1-4：任何异常退出都恢复自己冻结的进程
+            for pid in list(self.suspended_pids):
+                guard.resume_pid(pid)
+                log("finally 安全网: 恢复冻结进程 PID {}".format(pid))
+            self.suspended_pids.clear()
+            guard.clear_suspended()
+            log("GUI 监控线程退出")
+
+    def _loop(self, allowed):
         while not self.stop_evt.is_set():
             cfg = guard.load_config()
             interval = cfg["poll_interval"]
@@ -165,53 +182,103 @@ class Monitor(threading.Thread):
                 ssid = None
 
             on_net, ssid = guard.is_on_guard_network(cfg, ssid)
-            procs = guard.find_processes(cfg["watch_apps"]) if on_net else []
 
+            try:
+                pending, alive = guard.detect_pending(cfg) if on_net else ({}, set())
+            except Exception as e:
+                log("进程检测异常: {}".format(e))
+                pending, alive = {}, set()
+
+            allowed = {(p, c) for (p, c) in allowed if (p, c) in alive}
+            pending = {g: [(n, p, i) for (n, p, i) in items if (p, i[0]) not in allowed]
+                       for g, items in pending.items()}
+            pending = {g: items for g, items in pending.items() if items}
+
+            all_procs = [(n, p) for items in pending.values() for n, p, _ in items]
             self.ui_queue.put(("status", {
-                "ssid": ssid, "on_net": on_net,
-                "interval": interval, "procs": procs,
-                "allowed": set(allowed),
+                "ssid": ssid, "on_net": on_net, "interval": interval,
+                "procs": all_procs, "allowed": {p for p, _ in allowed},
             }))
 
-            if on_net and procs:
-                alive = {p for _, p in procs}
-                allowed &= alive
-                pending = [(n, p) for n, p in procs if p not in allowed]
-                if pending:
-                    names = sorted({n for n, _ in pending})
-                    log("受控网络「{}」发现进程: {}，先冻结等待确认".format(ssid, pending))
-                    self.suspended_pids = set()
-                    # 冻结进程：应用无法继续运行任何功能，直到用户决定
-                    for n, p in pending:
-                        if guard.suspend_pid(p):
-                            self.suspended_pids.add(p)
-                        else:
-                            log("冻结进程 {} (PID {}) 失败，将在确认后直接结束".format(n, p))
-                    self.ask_payload = pending
-                    self.ask_open = True
-                    self.ask_answer = False
-                    self.ask_lock.clear()
-                    self.ui_queue.put(("ask", {"ssid": ssid, "pending": pending}))
-                    self.ask_lock.wait(timeout=180)  # 180 秒无人响应按"取消"处理
-                    if self.stop_evt.is_set():
-                        break
-                    self.ask_payload = None
-                    self.ask_open = False
-                    if self.ask_answer:
-                        for n, p in pending:
-                            if p in self.suspended_pids:
-                                guard.resume_pid(p)
-                        allowed.update(p for _, p in pending)
-                        log("用户确认允许: {}".format(pending))
+            if pending:
+                group_lines = []
+                all_items = []
+                for g, items in sorted(pending.items()):
+                    group_lines.append("{}（{}）".format(g, ", ".join(n for n, _, _ in items)))
+                    all_items.extend(items)
+                pids_desc = [(n, p) for n, p, _ in all_items]
+                log("受控网络「{}」发现进程: {}，先冻结等待确认".format(ssid, pids_desc))
+
+                # 冻结 + 持久化（P1-4 安全网）
+                suspended_entries = []
+                freeze_failed = []
+                self.suspended_pids.clear()
+                for n, p, ident in all_items:
+                    if guard.suspend_pid(p):
+                        suspended_entries.append([p, ident[1], ident[0]])
+                        self.suspended_pids.add(p)
                     else:
-                        for n, p in pending:
-                            ok = guard.kill_pid(p)
-                            log("用户取消/超时，结束进程 {} (PID {}) -> {}".format(
-                                n, p, "成功" if ok else "失败"))
-                    self.suspended_pids = set()
+                        freeze_failed.append(n)
+                        log("冻结进程 {} (PID {}) 失败，确认前它将继续运行".format(n, p))
+                guard.save_suspended(suspended_entries)
+
+                # 弹窗询问（UI 线程渲染；对话框自身负责倒计时超时）
+                self.ask_payload = {"pids": all_items}
+                self.ask_pids = {p for _, p, _ in all_items}
+                self.ask_open = True
+                self.ask_answer = False
+                self.ask_timed_out = False
+                self.ask_lock.clear()
+                self.ui_queue.put(("ask", {
+                    "ssid": ssid, "groups": group_lines,
+                    "freeze_failed": freeze_failed,
+                    "timeout": cfg["ask_timeout"],
+                    "timeout_action": cfg["timeout_action"],
+                }))
+                # 对话框保证超时后会 set；+60s 纯兜底
+                self.ask_lock.wait(timeout=cfg["ask_timeout"] + 60)
+                if self.stop_evt.is_set():
+                    # 停止守护：恢复运行而不是关闭（用户主动停止管控）
+                    for pid in list(self.suspended_pids):
+                        guard.resume_pid(pid)
+                    self.suspended_pids.clear()
+                    guard.clear_suspended()
+                    break
+                timed_out = self.ask_timed_out
+                self.ask_payload = None
+                self.ask_pids = set()
+                self.ask_open = False
+
+                if timed_out:
+                    log("等待确认超时（{} 秒），按配置默认动作: {}".format(
+                        cfg["ask_timeout"], "放行" if self.ask_answer else "关闭"))
+                elif self.ask_answer:
+                    log("用户确认允许: {}".format(pids_desc))
+                else:
+                    log("用户取消，开始关闭: {}".format(pids_desc))
+
+                # 逐个处理（带 PID 三元组校验，P1-5）
+                for n, p, ident in all_items:
+                    if not guard.identity_matches(p, ident):
+                        log("PID {} ({}) 身份已变化（退出或被系统复用），跳过操作".format(p, n))
+                        self.suspended_pids.discard(p)
+                        continue
+                    if self.ask_answer:
+                        if guard.resume_pid(p):
+                            allowed.add((p, ident[0]))
+                        else:
+                            log("恢复进程 {} (PID {}) 失败".format(n, p))
+                    else:
+                        ok = guard.graceful_kill(p)  # P0-1：优雅关闭优先
+                        log("已关闭 {} (PID {}) -> {}".format(n, p, "成功" if ok else "失败"))
+                    self.suspended_pids.discard(p)
+                guard.clear_suspended()
+
+                # P0-1：关闭代理类应用后自愈残留的系统代理
+                if not self.ask_answer and cfg["post_kill_restore_proxy"]:
+                    guard.restore_system_proxy_if_dead()
 
             self.stop_evt.wait(interval if on_net else cfg["idle_interval"])
-        log("GUI 监控线程退出")
 
 
 # ---------------------------------------------------------------- 主界面
@@ -219,12 +286,13 @@ class GuardGUI:
     def __init__(self, root):
         self.root = root
         root.title(WINDOW_TITLE)
-        root.geometry("640x680")
+        root.geometry("660x700")
         root.minsize(560, 600)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.ui_queue = queue.Queue()
         self.monitor = None
+        self.ask_window = None
         self._log_offset = 0
 
         self._build_ui()
@@ -311,7 +379,6 @@ class GuardGUI:
         self.lbl_state.pack(anchor="w")
         self.banner = tk.Label(self.root, text="", bg=COLOR_WARN_BG, fg=COLOR_DANGER,
                                font=("Microsoft YaHei", 10, "bold"), pady=6)
-        # 横幅默认不显示，命中受控网络时 pack
 
         # 受控网络
         grp_net = ttk.LabelFrame(self.root, text=" 受控网络（Wi-Fi 名称，命中即管控） ")
@@ -326,7 +393,7 @@ class GuardGUI:
         ttk.Button(fb, text="删除选中", command=lambda: self._del_selected(self.lst_ssids)).pack(fill="x")
 
         # 受控应用
-        grp_app = ttk.LabelFrame(self.root, text=" 受控应用（进程名，如 game.exe） ")
+        grp_app = ttk.LabelFrame(self.root, text=" 受控应用（进程名；多进程应用可用 组:名字(进程1,进程2) 格式） ")
         grp_app.pack(fill="x", **pad)
         self.lst_apps = tk.Listbox(grp_app, height=4, exportselection=False)
         self.lst_apps.pack(side="left", fill="both", expand=True, padx=6, pady=6)
@@ -352,15 +419,16 @@ class GuardGUI:
         self.ent_test = ttk.Entry(row, width=14)
         self.ent_test.pack(side="left", padx=(0, 12))
         ttk.Button(row, text="保存配置", command=self._save_config).pack(side="left")
-        ttk.Label(grp_opt, text="管控方式：命中受控网络时自动冻结受控应用并弹窗警告——确定=继续运行，取消=关闭",
-                  foreground="#666666").pack(anchor="w", padx=6, pady=(0, 6))
+        ttk.Label(grp_opt, text="管控方式：命中受控网络时冻结受控应用并弹窗——允许=继续运行，关闭=先优雅退出再兜底强杀。"
+                                "弹窗超时默认放行（ask_timeout/timeout_action 可在 config.json 配置）",
+                  foreground="#666666", wraplength=620, justify="left").pack(anchor="w", padx=6, pady=(0, 6))
 
         # 受控进程实时表
         grp_proc = ttk.LabelFrame(self.root, text=" 当前运行的受控应用 ")
         grp_proc.pack(fill="both", expand=True, **pad)
         cols = ("name", "pid", "state")
         self.tree = ttk.Treeview(grp_proc, columns=cols, show="headings", height=5)
-        for c, w, t in (("name", 220, "进程名"), ("pid", 100, "PID"), ("state", 140, "状态")):
+        for c, w, t in (("name", 220, "进程名"), ("pid", 100, "PID"), ("state", 160, "状态")):
             self.tree.heading(c, text=t)
             self.tree.column(c, width=w, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True, padx=6, pady=6)
@@ -378,7 +446,7 @@ class GuardGUI:
         # 底部按钮区
         bot = ttk.Frame(self.root)
         bot.pack(fill="x", **pad)
-        self.btn_toggle = ttk.Button(bot, text="开始守护", width=14, command=self.toggle_monitor)
+        self.btn_toggle = ttk.Button(bot, text="停止守护", width=14, command=self.toggle_monitor)
         self.btn_toggle.pack(side="left")
         self.var_autostart = tk.BooleanVar(value=autostart_installed())
         ttk.Checkbutton(bot, text="开机自启动", variable=self.var_autostart,
@@ -393,8 +461,11 @@ class GuardGUI:
         for s in cfg["watch_ssids"]:
             self.lst_ssids.insert("end", s)
         self.lst_apps.delete(0, "end")
-        for a in cfg["watch_apps"]:
-            self.lst_apps.insert("end", a)
+        for g in cfg["watch_apps"]:
+            if g["processes"] == [g["name"]]:
+                self.lst_apps.insert("end", g["name"])
+            else:
+                self.lst_apps.insert("end", "组:{}({})".format(g["name"], ",".join(g["processes"])))
         self.spn_interval.delete(0, "end")
         self.spn_interval.insert(0, str(cfg["poll_interval"]))
         self.spn_idle.delete(0, "end")
@@ -422,10 +493,28 @@ class GuardGUI:
                 listbox.delete(i)
             self._save_config(silent=True)  # 自动保存，立即生效
 
+    @staticmethod
+    def _parse_app_line(line):
+        """解析列表行 -> 单进程字符串 或 应用组 dict。"""
+        line = line.strip()
+        m = __import__("re").match(r"^组[:：](.+?)[\(（](.+)[\)）]$", line)
+        if m:
+            name = m.group(1).strip().lower()
+            procs = [p.strip().lower() for p in __import__("re").split("[,，]", m.group(2)) if p.strip()]
+            if name and procs:
+                return {"group": name, "processes": procs}
+            return None
+        return line.lower()
+
     def _save_config(self, silent=False):
+        apps = []
+        for i in range(self.lst_apps.size()):
+            parsed = self._parse_app_line(self.lst_apps.get(i))
+            if parsed:
+                apps.append(parsed)
         cfg = {
             "watch_ssids": list(self.lst_ssids.get(0, "end")),
-            "watch_apps": [a.strip().lower() for a in self.lst_apps.get(0, "end") if a.strip()],
+            "watch_apps": apps,
             "poll_interval": max(1, int(float(self.spn_interval.get() or 2))),
             "idle_interval": max(1, int(float(self.spn_idle.get() or 5))),
             "test_ssid": self.ent_test.get().strip(),
@@ -449,15 +538,18 @@ class GuardGUI:
         log("守护已启动（GUI）")
 
     def _stop_monitor(self):
-        if self.monitor:
-            self.monitor.stop_evt.set()
-            if self.monitor.ask_open:
-                self.monitor.ask_answer = False
-                self.monitor.ask_lock.set()  # 让线程尽快退出等待
+        m = self.monitor
+        if m:
+            m.stop_evt.set()
+            if m.ask_open:
+                # 停止守护 = 停止管控：放行（恢复运行）而不是关闭
+                m.ask_answer = True
+                m.ask_lock.set()
             # 恢复所有被冻结的进程，避免应用卡死
-            for pid in list(self.monitor.suspended_pids):
+            for pid in list(m.suspended_pids):
                 guard.resume_pid(pid)
-            self.monitor.suspended_pids.clear()
+                log("守护已停止，恢复冻结进程 PID {}".format(pid))
+            m.suspended_pids.clear()
         self.monitor = None
         self.btn_toggle.config(text="开始守护")
         self._set_state(monitoring=False, ssid=None, on_net=False, procs=[], allowed=set())
@@ -468,15 +560,14 @@ class GuardGUI:
         if not sel:
             return
         for iid in sel:
-            name, pid = self.tree.item(iid, "values")[0], int(self.tree.item(iid, "values")[1])
-            ok = guard.kill_pid(pid)
-            log("手动结束进程 {} (PID {}) -> {}".format(name, pid, "成功" if ok else "失败"))
+            values = self.tree.item(iid, "values")
+            name, pid = values[0], int(values[1])
+            ok = guard.graceful_kill(pid)
+            log("手动关闭进程 {} (PID {}) -> {}".format(name, pid, "成功" if ok else "失败"))
 
     # ---------- 状态渲染 ----------
     def _set_state(self, monitoring, ssid, on_net, procs, allowed):
-        pending_pids = set()
-        if self.monitor and self.monitor.ask_open and self.monitor.ask_payload:
-            pending_pids = {p for _, p in self.monitor.ask_payload}
+        pending_pids = set(self.monitor.ask_pids) if (self.monitor and self.monitor.ask_open) else set()
 
         if not monitoring:
             self.lbl_net.config(text="当前网络：--")
@@ -497,7 +588,7 @@ class GuardGUI:
         for n, p in procs:
             if p in pending_pids:
                 state = "已冻结待确认"
-            elif p in allowed:
+            elif (p, None) in allowed or p in allowed:
                 state = "已放行（本次）"
             else:
                 state = "已检测"
@@ -505,6 +596,8 @@ class GuardGUI:
 
     def _tick_status_when_idle(self):
         """守护未启动时也周期刷新一次当前网络显示。"""
+        if not self.root.winfo_exists():
+            return
         if not (self.monitor and self.monitor.is_alive()):
             try:
                 cfg = read_config()
@@ -516,12 +609,15 @@ class GuardGUI:
 
     # ---------- 队列处理 ----------
     def _poll_queue(self):
+        if not self.root.winfo_exists():
+            return
         try:
             while True:
                 kind, data = self.ui_queue.get_nowait()
                 if kind == "status":
-                    self._set_state(True, data["ssid"], data["on_net"],
-                                    data["procs"], data["allowed"])
+                    if self.monitor and self.monitor.is_alive():
+                        self._set_state(True, data["ssid"], data["on_net"],
+                                        data["procs"], data["allowed"])
                 elif kind == "ask":
                     self._show_ask_dialog(data)
         except queue.Empty:
@@ -529,15 +625,72 @@ class GuardGUI:
         self.root.after(300, self._poll_queue)
 
     def _show_ask_dialog(self, data):
-        names = sorted({n for n, _ in data["pending"]})
-        lines = ["当前已连接受控网络「{}」。".format(data["ssid"]), "",
-                 "以下受管控的应用已启动，现已被冻结暂停、无法运行："]
-        lines += ["  - {}".format(n) for n in names]
-        lines += ["", "点【确定】允许其继续运行，点【取消】将立即强制关闭。"]
-        ok = messagebox.askokcancel("网络管控警告", "\n".join(lines), icon="warning")
-        if self.monitor:
-            self.monitor.ask_answer = bool(ok)
-            self.monitor.ask_lock.set()
+        """带倒计时的非模态警告框（P0-3/P2-3/P2-4）。"""
+        try:
+            if self.ask_window and self.ask_window.winfo_exists():
+                self.ask_window.destroy()
+        except Exception:
+            pass
+
+        win = tk.Toplevel(self.root)
+        win.title("网络管控警告")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        frm = tk.Frame(win, padx=16, pady=12)
+        frm.pack()
+
+        tk.Label(frm, text="当前已连接受控网络「{}」。".format(data["ssid"]),
+                 font=("Microsoft YaHei", 11, "bold")).pack(anchor="w")
+        tk.Label(frm, text="以下受管控的应用已启动，现已被冻结暂停、无法运行：",
+                 wraplength=440, justify="left").pack(anchor="w", pady=(8, 2))
+        for line in data["groups"]:
+            tk.Label(frm, text="  - " + line, fg="#c62828",
+                     wraplength=440, justify="left").pack(anchor="w")
+        if data.get("freeze_failed"):
+            tk.Label(frm, text="（未能冻结，将继续运行直到你选择）：{}".format(", ".join(data["freeze_failed"])),
+                     fg="#e65100", wraplength=440, justify="left").pack(anchor="w", pady=(4, 0))
+        tk.Label(frm, text="点【允许运行】继续；点【强制关闭】将先尝试优雅退出、超时后强制结束（可能丢失未保存数据）。",
+                 wraplength=440, justify="left").pack(anchor="w", pady=(8, 2))
+
+        cd_lbl = tk.Label(frm, text="", fg="#888888")
+        cd_lbl.pack(anchor="e")
+
+        def resolve(ans, timed=False):
+            m = self.monitor
+            if m and m.ask_open:
+                m.ask_answer = bool(ans)
+                m.ask_timed_out = timed
+                m.ask_lock.set()
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self.ask_window = None
+
+        def on_timeout():
+            resolve(data["timeout_action"] == "allow", timed=True)
+
+        remaining = [max(5, int(data["timeout"]))]
+        timeout_action = data["timeout_action"]
+
+        def tick():
+            if not win.winfo_exists():
+                return
+            remaining[0] -= 1
+            if remaining[0] <= 0:
+                on_timeout()
+                return
+            cd_lbl.config(text="{} 秒后自动{}".format(remaining[0], "允许运行" if timeout_action == "allow" else "强制关闭"))
+            cd_lbl.config(fg="#c62828" if remaining[0] <= 30 else "#888888")
+            win.after(1000, tick)
+
+        btns = tk.Frame(frm)
+        btns.pack(fill="x", pady=(10, 0))
+        tk.Button(btns, text="允许运行", width=12, command=lambda: resolve(True)).pack(side="right", padx=(8, 0))
+        tk.Button(btns, text="强制关闭", width=12, command=lambda: resolve(False)).pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", lambda: resolve(False))
+        win.after(1000, tick)
+        self.ask_window = win
 
     # ---------- 日志窗口 ----------
     def _refresh_log(self, initial=False):
@@ -546,16 +699,19 @@ class GuardGUI:
             if initial:
                 with io.open(LOG_PATH, "rb") as f:
                     data = f.read()
-                # 只显示最后 4000 字节，避免启动时刷屏
                 text = data[-4000:].decode("utf-8", errors="replace")
                 self._log_offset = max(0, size - len(text.encode("utf-8")))
-            elif size > self._log_offset:
+            elif size < self._log_offset:
+                # 日志被轮转了，重新开始
+                self._log_offset = 0
+                return
+            elif size == self._log_offset:
+                return
+            else:
                 with io.open(LOG_PATH, "rb") as f:
                     f.seek(self._log_offset)
                     text = f.read().decode("utf-8", errors="replace")
                 self._log_offset = size
-            else:
-                return
             self.txt_log.config(state="normal")
             self.txt_log.insert("end", text)
             self.txt_log.see("end")
@@ -564,6 +720,8 @@ class GuardGUI:
             pass
 
     def _tick_log(self):
+        if not self.root.winfo_exists():
+            return
         self._refresh_log()
         self.root.after(1000, self._tick_log)
 
@@ -588,15 +746,16 @@ class GuardGUI:
                 pass
 
     def _quit_all(self):
-        if self.monitor:
-            self.monitor.stop_evt.set()
-            if self.monitor.ask_open:
-                self.monitor.ask_answer = False
-                self.monitor.ask_lock.set()
-            # 恢复所有被冻结的进程，避免应用卡死
-            for pid in list(self.monitor.suspended_pids):
+        m = self.monitor
+        if m:
+            m.stop_evt.set()
+            if m.ask_open:
+                m.ask_answer = True  # 退出程序 = 停止管控，恢复运行
+                m.ask_lock.set()
+            for pid in list(m.suspended_pids):
                 guard.resume_pid(pid)
-            self.monitor.suspended_pids.clear()
+                log("退出安全网: 恢复冻结进程 PID {}".format(pid))
+            m.suspended_pids.clear()
         if self.tray:
             try:
                 self.tray.stop()

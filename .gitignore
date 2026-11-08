@@ -5,3 +5,4 @@ config.json
 guard.log
 __pycache__/
 *.pyc
+.idea/
