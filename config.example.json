@@ -1,0 +1,7 @@
+{
+  "watch_ssids": ["办公室WiFi", "Company-WiFi"],
+  "watch_apps": ["game.exe", "someapp.exe"],
+  "poll_interval": 2,
+  "idle_interval": 5,
+  "test_ssid": ""
+}

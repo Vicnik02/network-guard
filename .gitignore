@@ -1,0 +1,7 @@
+# 个人配置（含真实 Wi-Fi 名，不入库）
+config.json
+
+# 运行产物
+guard.log
+__pycache__/
+*.pyc
